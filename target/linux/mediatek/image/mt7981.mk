@@ -586,7 +586,7 @@ define Device/cmcc_rax3000m
   DEVICE_MODEL := RAX3000M NAND
   DEVICE_DTS := mt7981-cmcc-rax3000m
   DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
-  DEVICE_PACKAGES := $(MT7981_USB_PKGS) luci-app-samba4
+  DEVICE_PACKAGES := $(filter-out luci-app-usb-printer luci-i18n-usb-printer-zh-cn,$(MT7981_USB_PKGS))
   SUPPORTED_DEVICES := cmcc,rax3000m
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k

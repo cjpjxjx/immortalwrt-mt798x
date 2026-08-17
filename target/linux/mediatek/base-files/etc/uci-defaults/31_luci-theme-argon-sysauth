@@ -1,0 +1,6 @@
+rm -f /usr/lib/lua/luci/view/themes/argon/sysauth.htm
+rm -f /www/luci-static/argon/img/bg1.jpg
+rm -f /usr/libexec/argon/online_wallpaper
+rm -f /www/luci-static/argon/background/README.md
+
+exit 0

@@ -56,7 +56,7 @@ To build your own firmware you need a GNU/Linux, BSD or MacOSX system (case sens
   5. Copy the configuration file for your device from the `defconfig` directory to the project root directory and rename it `.config`
      
      ```
-     # MT7981
+     # MT7981 (CMCC RAX3000M NAND only, see docs/rax3000m-optimizations.md)
      cp -f defconfig/mt7981-ax3000.config .config
 
      # MT7986
@@ -68,6 +68,9 @@ To build your own firmware you need a GNU/Linux, BSD or MacOSX system (case sens
      
   7. Run `make menuconfig` to select your preferred configuration for the toolchain, target system & firmware packages.
   8. Run `make -j$(nproc)` to build your firmware. This will download all sources, build the cross-compile toolchain and then cross-compile the GNU/Linux kernel & all chosen applications for your target system.
+
+  ### One-click build
+  Alternatively, run `./build.sh` to do steps 3-8 automatically for the CMCC RAX3000M (NAND) target. It also strips a few build-time-only assets (e.g. the Argon login-page background) that the manual flow above can only remove at runtime, and clears stale build cache before compiling. See [docs/rax3000m-optimizations.md](docs/rax3000m-optimizations.md) for details.
 
   ### Related Repositories
   The main repository uses multiple sub-repositories to manage packages of different categories. All packages are installed via the ImmortalWrt package manager called opkg. If you're looking to develop the web interface or port packages to ImmortalWrt, please find the fitting repository below.
