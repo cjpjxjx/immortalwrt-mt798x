@@ -1,0 +1,47 @@
+
+config globals 'globals'
+	option mmx_mask '0x3F00'
+
+config interface 'wifi5g'
+	option enabled '1'
+	option family 'ipv4'
+	option reliability '1'
+	option count '1'
+	option timeout '2'
+	option interval '5'
+	option down '3'
+	option up '3'
+	list track_ip '119.29.29.29'
+	list track_ip '223.5.5.5'
+
+config interface 'cpe5g'
+	option enabled '1'
+	option family 'ipv4'
+	option reliability '1'
+	option count '1'
+	option timeout '2'
+	option interval '5'
+	option down '3'
+	option up '3'
+	list track_ip '119.29.29.29'
+	list track_ip '223.5.5.5'
+
+config member 'member_wifi5g'
+	option metric '1'
+	option weight '1'
+	option interface 'wifi5g'
+
+config member 'member_cpe5g'
+	option metric '2'
+	option weight '1'
+	option interface 'cpe5g'
+
+config policy 'wan_failover'
+	list use_member 'member_cpe5g'
+	list use_member 'member_wifi5g'
+
+config rule 'default_rule_v4'
+	option dest_ip '0.0.0.0/0'
+	option family 'ipv4'
+	option use_policy 'wan_failover'
+

@@ -16,6 +16,8 @@
 
 [README.md](README.md) 面向使用者，讲编译环境准备、编译步骤与支持渠道；本文件面向开发，讲关键设计决策与操作性约束；[docs/rax3000m-optimizations.md](docs/rax3000m-optimizations.md) 是 RAX3000M 定制编译的详细技术记录（组件增删清单、源码改动清单、刷机后配置事项），本文件的"核心设计原则"与"关键设计决策"是对该文档的提炼总结，具体实现细节以该文档为准，两者冲突时以 docs/rax3000m-optimizations.md 为准并同步修订本文件。
 
+[docs/rax3000m-mwan3-failover.md](docs/rax3000m-mwan3-failover.md) 记录本机 mwan3 双 WAN 故障转移的**刷机后运行时配置**（含踩坑结论与自研运维脚本），不参与编译、不影响固件产物；配套脚本与配置副本在 [docs/mwan3/](docs/mwan3/)。改动该目录下的脚本时，须同步更新该文档中对应小节的说明。
+
 ## 项目概述
 
 本仓库是 [ImmortalWrt](https://github.com/immortalwrt/immortalwrt)（OpenWrt 分支）针对联发科 MT798x 系列芯片（[immortalwrt-mt798x](https://cmi.hanwckf.top/p/immortalwrt-mt798x/)）的固件源码，在此基础上进一步定制为**仅面向 CMCC RAX3000M（MT7981，128M SPI-NAND）单设备**的精简编译分支：移除不需要的 LuCI 组件与依赖以节省固件体积、保留 MediaTek HNAT 转发加速、补齐 USB 4G 上网卡与 ADB 调试支持，并提供一键编译脚本。
@@ -73,6 +75,7 @@ README.md、CLAUDE.md、docs/*.md 及代码注释遵守：
 - **[target/linux/mediatek/image/mt7981.mk](target/linux/mediatek/image/mt7981.mk)** —— `Device/cmcc_rax3000m`（约 584 行）定义设备镜像参数与 `DEVICE_PACKAGES`；`MT7981_USB_PKGS`（文件头，约第 3 行）是逐设备复用的 USB 包组基线。改设备级别的默认包组（区别于 defconfig 的全局包）看这里。
 - **[target/linux/mediatek/base-files/etc/uci-defaults/31_luci-theme-argon-sysauth](target/linux/mediatek/base-files/etc/uci-defaults/31_luci-theme-argon-sysauth)** —— 首次开机删除 Argon 登录页资源文件（运行时兜底，仅对可写 overlay 生效）。
 - **[target/linux/mediatek/base-files/etc/uci-defaults/32_default-lan-ip](target/linux/mediatek/base-files/etc/uci-defaults/32_default-lan-ip)** —— 首次开机将 `network.lan.ipaddr` 改为 `192.168.64.1`，按 `board_name` 限定设备范围。改首次开机默认配置看这里，新增同类脚本参考此文件的判断结构。
+- **[docs/rax3000m-mwan3-failover.md](docs/rax3000m-mwan3-failover.md) + [docs/mwan3/](docs/mwan3/)** —— mwan3 双 WAN 故障转移（5G 无线中继主线 + USB CPE 备线）的运行时部署记录与自研脚本（`mwan3-check` 看门狗、`mwan3-notify*` 邮件告警）。相关软件包由 opkg 刷机后安装，不在 defconfig 中；改运行时联网/告警行为看这里。
 - **[docs/rax3000m-optimizations.md](docs/rax3000m-optimizations.md)** —— RAX3000M 定制编译的详细技术记录：已移除组件清单、转发加速现状、ADB 支持细节、刷机后需手动配置的事项、涉及的全部源码改动文件列表。体量不大可整份阅读，但优先按需定位对应小节。
 
 ## 关键设计决策

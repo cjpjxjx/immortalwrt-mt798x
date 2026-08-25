@@ -1,0 +1,19 @@
+# msmtp config template for mwan3-notify.sh - fill in real values and copy
+# to /etc/mwan3-notify/msmtprc ON THE ROUTER ONLY. Do not commit a filled-in
+# copy of this file anywhere in the repo.
+#
+# chmod 600 /etc/mwan3-notify/msmtprc after copying: msmtp refuses to use a
+# config file that is group/world readable.
+
+defaults
+tls on
+tls_starttls off
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+
+account default
+host <smtp-host>
+port 465
+auth on
+user <smtp-user>
+password <smtp-password>
+from <envelope-from-address>

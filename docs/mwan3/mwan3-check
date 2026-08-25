@@ -1,0 +1,247 @@
+#!/bin/sh
+# mwan3 health check / watchdog for RAX3000M.
+#
+# Repairs two upstream mwan3 problems seen on this device:
+#
+#   1. mwan3 (START=19) can finish procd registration after network (START=20)
+#      has already emitted its first ifup events. Dropped events leave the
+#      tracker paused ("hotplug called on <iface> before mwan3 has been set up")
+#      and it never recovers on its own. Reproducible at boot, and at runtime
+#      after anything that bounces interfaces while mwan3 restarts, such as
+#      "wifi reload" or editing the mwan3 config in LuCI.
+#
+#   2. Concurrent ifup of several members can leave an interface without its
+#      default route in the main table or in its own policy table, so the
+#      mwan3track probes fail and a working link gets marked offline.
+#
+# A member that netifd reports as down is skipped: mwan3 pausing that tracker
+# is correct behaviour, and bouncing the interface would be pointless churn
+# (this is why the mwan3 output alone is not a reliable problem signal - a
+# legitimately disconnected link also reports "tracking is paused").
+#
+# While a repair is in progress this holds $REPAIR_LOCK. mwan3-notify.sh
+# (see docs/rax3000m-mwan3-failover.md section 6) waits for that lock to
+# clear before treating a connected/disconnected event as real, since a
+# restart or bounce done here can itself make mwan3track re-announce
+# connected/disconnected for a member that never actually went down.
+#
+# Usage:
+#   mwan3-check           check now, repair if needed  (cron)
+#   mwan3-check --boot    wait for members first, then check  (rc.local)
+#
+# Install to /usr/bin/mwan3-check on the router.
+
+NAME="mwan3-check"
+
+BOOT_MODE=0
+[ "$1" = "--boot" ] && BOOT_MODE=1
+
+# --boot only: how long to wait for members to come up before checking anyway.
+BOOT_IFACE_WAIT=180
+# Settle time after restarting mwan3 / after bouncing one interface.
+RESTART_SETTLE=15
+IFACE_SETTLE=10
+MAX_ROUNDS=3
+POLL_INTERVAL=5
+
+LOCK="/tmp/${NAME}.lock"
+STALE_LOCK_MIN=10
+
+# Held for the duration of any repair action (mwan3 restart or interface
+# bounce), so mwan3-notify.sh can tell "mwan3-check is mid-repair" apart from
+# a genuine link change. Not the same as $LOCK: $LOCK covers the whole run
+# (including the "nothing to do" case) and mwan3-notify.sh has no business
+# waiting on that.
+REPAIR_LOCK="/tmp/${NAME}.repairing"
+
+log() {
+	logger -t "$NAME" "$1"
+	echo "$NAME: $1"
+}
+
+# Overlapping runs would race each other's ifdown/ifup, which is the very
+# problem this script exists to fix.
+take_lock() {
+	mkdir "$LOCK" 2>/dev/null && return 0
+
+	# A run killed before cleanup would otherwise block the watchdog forever.
+	if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +${STALE_LOCK_MIN} 2>/dev/null)" ]; then
+		log "clearing stale lock"
+		rmdir "$LOCK" 2>/dev/null
+		mkdir "$LOCK" 2>/dev/null && return 0
+	fi
+	return 1
+}
+
+# mwan3 members, in the order declared in /etc/config/mwan3.
+mwan3_members() {
+	uci show mwan3 2>/dev/null \
+		| sed -n 's/^mwan3\.\([^.=]*\)=interface$/\1/p' \
+		| while read -r iface; do
+			[ "$(uci -q get "mwan3.${iface}.enabled")" = "1" ] && echo "$iface"
+		done
+}
+
+iface_status() {
+	ubus call "network.interface.$1" status 2>/dev/null
+}
+
+iface_is_up() {
+	iface_status "$1" | grep -q '"up": true'
+}
+
+iface_device() {
+	iface_status "$1" \
+		| sed -n 's/.*"l3_device": "\([^"]*\)".*/\1/p' \
+		| head -n1
+}
+
+# Policy table id mwan3 assigned to a device, read back from the live rules it
+# installed, so reordering /etc/config/mwan3 needs no change here.
+iface_table() {
+	ip rule show 2>/dev/null \
+		| sed -n "s/^[0-9]*:[[:space:]]*from all iif $1 lookup \([0-9]*\)\$/\1/p" \
+		| head -n1
+}
+
+main_has_default() {
+	ip route show table main 2>/dev/null | grep -qE "^default .* dev $1( |\$)"
+}
+
+table_has_default() {
+	ip route show table "$1" 2>/dev/null | grep -q '^default'
+}
+
+wait_for_members() {
+	local waited=0 pending iface
+
+	while [ "$waited" -lt "$BOOT_IFACE_WAIT" ]; do
+		pending=""
+		for iface in $(mwan3_members); do
+			iface_is_up "$iface" || pending="$pending $iface"
+		done
+		[ -z "$pending" ] && return 0
+		sleep "$POLL_INTERVAL"
+		waited=$((waited + POLL_INTERVAL))
+	done
+
+	log "still waiting on:$pending after ${BOOT_IFACE_WAIT}s, checking anyway"
+}
+
+# Emits "<iface> <device> <reason>" per problem found, nothing when healthy.
+# Only members that netifd reports as up are judged.
+find_problems() {
+	local status iface device tid
+
+	status=$(mwan3 status 2>/dev/null)
+
+	for iface in $(mwan3_members); do
+		iface_is_up "$iface" || continue
+		device=$(iface_device "$iface")
+		[ -n "$device" ] || continue
+
+		if printf '%s\n' "$status" \
+			| grep -q "^ interface $iface is .*tracking is paused\$"; then
+			echo "$iface $device paused"
+			continue
+		fi
+
+		tid=$(iface_table "$device")
+		if [ -z "$tid" ]; then
+			echo "$iface $device no-policy-rule"
+			continue
+		fi
+		if ! main_has_default "$device"; then
+			echo "$iface $device no-main-route"
+			continue
+		fi
+		if ! table_has_default "$tid"; then
+			echo "$iface $device no-table-route"
+		fi
+	done
+}
+
+# "paused" and a missing policy rule both mean mwan3 itself lost track of the
+# interface; only a restart resyncs it. Missing routes are netifd state, fixed
+# by bouncing that one interface.
+repair() {
+	local problems="$1"
+	local tmp="${LOCK}/problems"
+	local iface device reason
+
+	if printf '%s\n' "$problems" | grep -qE ' (paused|no-policy-rule)$'; then
+		log "mwan3 lost track of an interface, restarting mwan3"
+		/etc/init.d/mwan3 restart
+		sleep "$RESTART_SETTLE"
+		return 0
+	fi
+
+	printf '%s\n' "$problems" > "$tmp"
+	# One at a time: bouncing members concurrently is what loses the routes.
+	while read -r iface device reason; do
+		[ -n "$iface" ] || continue
+		log "$iface ($device): $reason, bouncing interface"
+		ifdown "$iface"
+		sleep 3
+		ifup "$iface"
+		sleep "$IFACE_SETTLE"
+	done < "$tmp"
+	rm -f "$tmp"
+}
+
+main() {
+	local round=0 problems
+
+	if ! /etc/init.d/mwan3 enabled; then
+		log "mwan3 is disabled, nothing to do"
+		return 0
+	fi
+
+	if ! /etc/init.d/mwan3 running; then
+		log "mwan3 is enabled but not running, starting it"
+		/etc/init.d/mwan3 start
+		sleep "$RESTART_SETTLE"
+	fi
+
+	[ "$BOOT_MODE" = 1 ] && wait_for_members
+
+	while :; do
+		problems=$(find_problems)
+
+		if [ -z "$problems" ]; then
+			rm -f "$REPAIR_LOCK"
+			if [ "$round" -eq 0 ]; then
+				log "healthy, no action taken"
+			else
+				log "healthy after $round repair round(s)"
+			fi
+			return 0
+		fi
+
+		if [ "$round" -ge "$MAX_ROUNDS" ]; then
+			break
+		fi
+		round=$((round + 1))
+
+		: > "$REPAIR_LOCK"
+		printf '%s\n' "$problems" | while read -r line; do
+			[ -n "$line" ] && log "round $round: $line"
+		done
+		repair "$problems"
+	done
+
+	log "still unhealthy after $MAX_ROUNDS round(s), leaving it to mwan3 failover"
+	mwan3 status 2>/dev/null | grep '^ interface' | while read -r line; do
+		log "  $line"
+	done
+	rm -f "$REPAIR_LOCK"
+	return 1
+}
+
+take_lock || {
+	log "another run is in progress, skipping"
+	exit 0
+}
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
+main
