@@ -1,0 +1,388 @@
+#!/bin/sh
+# usb0 link watchdog for the 5G CPE hanging off this router.
+#
+# Problem it repairs: the CPE's USB network gadget (connman gadget tethering)
+# stops passing frames while both sides still report the interface UP. The
+# router's ARP entry for the CPE goes FAILED, ICMP and HTTP to the CPE both
+# time out, and neither side recovers on its own. adb over the same USB cable
+# keeps working throughout, because adb is a separate USB function - that is
+# what makes a remote repair possible at all.
+#
+# Why this runs on the router and not on the CPE: the repair itself has to run
+# on the CPE, but the CPE cannot reliably learn who to probe. Its neighbour
+# entry for the router degrades to FAILED and loses the MAC exactly when the
+# link dies, and that image has neither "ip neigh" nor arping. Here both
+# endpoint addresses are declared in UCI (network.<iface>.ipaddr / .gateway)
+# and stay readable no matter what the link is doing.
+#
+# Relationship to mwan3: mwan3 already tracks this link via track_ip and fails
+# over within seconds, so user traffic is not what this protects - it restores
+# the link itself, which mwan3 cannot do because the fix is on the far side.
+# Runs are skipped while mwan3-check holds a lock: its ifdown/ifup makes the
+# CPE legitimately unreachable and would otherwise read as a fault.
+#
+# Escalation inside one run: probe -> soft reset over adb -> probe -> soft
+# reset -> probe -> reboot the CPE. Reboots are rate limited and capped, so a
+# link that keeps dying surfaces as a log entry instead of a reboot loop.
+#
+# Usage:
+#   cpe-usb-watchdog            check, repair if needed  (cron)
+#   cpe-usb-watchdog --check    probe and report only, never touches anything
+#
+# Install to /usr/bin/cpe-usb-watchdog on the router.
+
+NAME="cpe-usb-watchdog"
+
+CHECK_ONLY=0
+[ "$1" = "--check" ] && CHECK_ONLY=1
+
+# uci interface holding the CPE link. Both endpoint addresses come from it.
+IFACE="cpe5g"
+# CPE-side gadget interface. Fixed by the CPE firmware's gadget config, not
+# discoverable from here, and the only value the repair has to name itself.
+CPE_DEVICE="usb0"
+
+# Detection. One successful probe in any round means healthy, so extra rounds
+# only ever reduce false positives from transient loss.
+PROBE_ROUNDS=3
+PROBE_GAP=8
+PING_COUNT=3
+PING_WAIT=2
+HTTP_TIMEOUT=3
+
+# Re-probe after a repair. Shorter than detection on purpose: a repair that
+# worked answers on the first round.
+VERIFY_ROUNDS=2
+VERIFY_GAP=8
+
+SOFT_RESET_ATTEMPTS=2
+SOFT_RESET_SETTLE=12
+
+ADB_TIMEOUT=10
+ADB_SHELL_TIMEOUT=20
+
+# A whole run must finish well inside the cron interval so runs never overlap.
+MAX_RUNTIME=240
+# Another soft reset plus the reboot decision needs roughly this much left.
+REMEDY_COST=80
+
+# The CPE needs time to boot before its silence means anything again.
+BOOT_GRACE=210
+# Never reboot more often than this, and never more than MAX_IN_WINDOW times
+# per WINDOW - past that point a reboot is not the answer and a human is.
+REBOOT_MIN_INTERVAL=1800
+REBOOT_WINDOW=21600
+REBOOT_MAX_IN_WINDOW=3
+
+LOCK="/tmp/${NAME}.lock"
+STALE_LOCK_MIN=10
+OUT="${LOCK}/out"
+# Healthy runs write here instead of to the log, so liveness is checkable
+# without a syslog line every five minutes.
+HEARTBEAT="/tmp/${NAME}.last-ok"
+# Persistent: the reboot rate limit has to survive a router reboot, and this
+# doubles as the audit trail for how often the watchdog has had to fire.
+REBOOT_HISTORY="/etc/${NAME}.reboots"
+
+# mwan3-check's locks. Its repairs bounce this very interface.
+MWAN3_LOCK="/tmp/mwan3-check.lock"
+MWAN3_REPAIR_LOCK="/tmp/mwan3-check.repairing"
+REPAIR_LOCK_HELD=0
+
+STARTED=$(date +%s)
+
+# Message goes in on stdin: busybox logger would parse one starting with "-"
+# as its own option.
+log() {
+	printf '%s\n' "$1" | logger -t "$NAME"
+	echo "$NAME: $1"
+}
+
+# Overlapping runs would probe while the other one is mid-repair and read the
+# resulting flap as a fresh fault.
+take_lock() {
+	mkdir "$LOCK" 2>/dev/null && return 0
+
+	# A run killed before cleanup would otherwise block the watchdog forever.
+	if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +${STALE_LOCK_MIN} 2>/dev/null)" ]; then
+		log "clearing stale lock"
+		rm -rf "$LOCK" 2>/dev/null
+		mkdir "$LOCK" 2>/dev/null && return 0
+	fi
+	return 1
+}
+
+budget_left() {
+	echo $((MAX_RUNTIME - ($(date +%s) - STARTED)))
+}
+
+# No timeout(1) on this image, and adb blocks indefinitely on a wedged USB
+# stack, so every adb call goes through this. Command output lands in $OUT.
+run_timeout() {
+	local secs="$1" pid waited=0
+	shift
+
+	"$@" >"$OUT" 2>&1 &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		if [ "$waited" -ge "$secs" ]; then
+			kill -9 "$pid" 2>/dev/null
+			wait "$pid" 2>/dev/null
+			return 124
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	wait "$pid"
+}
+
+# Deliberately has no built-in default address: guessing the peer is how a
+# probe ends up aimed at an address that was never there.
+resolve_target() {
+	CPE_ADDR=$(uci -q get "network.${IFACE}.gateway")
+	CPE_MASK=$(uci -q get "network.${IFACE}.netmask")
+	OUR_ADDR=$(uci -q get "network.${IFACE}.ipaddr")
+
+	DEVICE=$(ubus call "network.interface.${IFACE}" status 2>/dev/null \
+		| sed -n 's/.*"l3_device": "\([^"]*\)".*/\1/p' | head -n1)
+	[ -n "$DEVICE" ] || DEVICE=$(uci -q get "network.${IFACE}.device")
+
+	case "$CPE_ADDR" in
+		[0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+		*)
+			log "cannot read network.${IFACE}.gateway, refusing to guess"
+			return 1
+			;;
+	esac
+	[ -n "$DEVICE" ] || {
+		log "cannot resolve the device behind ${IFACE}"
+		return 1
+	}
+	[ -n "$OUR_ADDR" ] || {
+		log "cannot read network.${IFACE}.ipaddr"
+		return 1
+	}
+	[ -n "$CPE_MASK" ] || CPE_MASK="255.255.255.0"
+	return 0
+}
+
+iface_is_up() {
+	ubus call "network.interface.${IFACE}" status 2>/dev/null | grep -q '"up": true'
+}
+
+# A router-side interface that is down, or has lost its own address, is netifd's
+# or mwan3-check's problem. Rebooting the CPE would not fix either.
+router_side_ok() {
+	ip link show dev "$DEVICE" 2>/dev/null | grep -q "state UP" || {
+		log "${DEVICE} is not UP on this side, deferring"
+		return 1
+	}
+	ip -4 addr show dev "$DEVICE" 2>/dev/null | grep -q "inet ${OUR_ADDR}/" || {
+		log "${DEVICE} has no ${OUR_ADDR}, deferring to mwan3-check"
+		return 1
+	}
+	return 0
+}
+
+mwan3_busy() {
+	[ -e "$MWAN3_LOCK" ] || [ -e "$MWAN3_REPAIR_LOCK" ]
+}
+
+take_repair_lock() {
+	# Documented mwan3-check convention: a flap caused by a repair in progress
+	# is not a real link change, and anything watching events should know.
+	: > "$MWAN3_REPAIR_LOCK"
+	REPAIR_LOCK_HELD=1
+}
+
+drop_repair_lock() {
+	[ "$REPAIR_LOCK_HELD" = 1 ] && rm -f "$MWAN3_REPAIR_LOCK"
+	REPAIR_LOCK_HELD=0
+}
+
+# ICMP first, HTTP as a second opinion: /api/health answering proves the data
+# plane and the CPE's management stack are both back. Either one succeeding is
+# enough to call the link healthy.
+probe_once() {
+	ping -I "$DEVICE" -c "$PING_COUNT" -W "$PING_WAIT" -q "$CPE_ADDR" \
+		>/dev/null 2>&1 && return 0
+
+	run_timeout $((HTTP_TIMEOUT + 2)) wget -q -O - -T "$HTTP_TIMEOUT" \
+		"http://${CPE_ADDR}/api/health" || return 1
+	grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' "$OUT"
+}
+
+probe() {
+	local rounds="$1" gap="$2" round=1
+
+	while :; do
+		probe_once && return 0
+		[ "$round" -ge "$rounds" ] && return 1
+		round=$((round + 1))
+		sleep "$gap"
+	done
+}
+
+# Resolved explicitly so a second device on the hub cannot make the repair
+# ambiguous.
+adb_serial() {
+	run_timeout "$ADB_TIMEOUT" adb devices || return 1
+	awk '$2 == "device" { print $1; exit }' "$OUT"
+}
+
+adb_online() {
+	ADB_SERIAL=$(adb_serial)
+	[ -n "$ADB_SERIAL" ] && return 0
+
+	# A wedged adb server looks exactly like an absent device.
+	log "no adb device listed, restarting the adb server"
+	run_timeout "$ADB_TIMEOUT" adb kill-server
+	run_timeout "$ADB_TIMEOUT" adb start-server
+	ADB_SERIAL=$(adb_serial)
+	[ -n "$ADB_SERIAL" ]
+}
+
+# The verified repair: restart connman's gadget tethering session and re-apply
+# the CPE-side address. Deliberately leaves the USB gadget and UDC alone -
+# rebuilding those re-enumerates the whole composite device and takes adb down
+# with it, which is the only channel this script has.
+soft_reset() {
+	local rc
+
+	run_timeout "$ADB_SHELL_TIMEOUT" adb -s "$ADB_SERIAL" shell "
+		connmanctl tether gadget off
+		sleep 1
+		connmanctl disable gadget
+		sleep 1
+		connmanctl enable gadget
+		sleep 1
+		connmanctl tether gadget on
+		sleep 1
+		ifconfig ${CPE_DEVICE} ${CPE_ADDR} netmask ${CPE_MASK}
+		ip link set dev ${CPE_DEVICE} up
+	"
+	rc=$?
+	[ "$rc" = 124 ] && log "adb shell timed out during the soft reset"
+
+	# The stale FAILED entry outlives the repair otherwise.
+	ip neigh flush dev "$DEVICE" 2>/dev/null
+}
+
+last_reboot_ts() {
+	local ts
+	ts=$(awk 'END { print $1 }' "$REBOOT_HISTORY" 2>/dev/null)
+	case "$ts" in
+		''|*[!0-9]*) echo 0 ;;
+		*) echo "$ts" ;;
+	esac
+}
+
+in_boot_grace() {
+	local last
+	last=$(last_reboot_ts)
+	[ "$last" = 0 ] && return 1
+	[ $(($(date +%s) - last)) -lt "$BOOT_GRACE" ]
+}
+
+reboot_allowed() {
+	local now last count
+	now=$(date +%s)
+	last=$(last_reboot_ts)
+
+	if [ "$last" != 0 ] && [ $((now - last)) -lt "$REBOOT_MIN_INTERVAL" ]; then
+		log "last reboot was $((now - last))s ago, holding off this time"
+		return 1
+	fi
+
+	count=$(awk -v cutoff=$((now - REBOOT_WINDOW)) \
+		'$1 ~ /^[0-9]+$/ && $1 >= cutoff { n++ } END { print n + 0 }' \
+		"$REBOOT_HISTORY" 2>/dev/null)
+	case "$count" in
+		''|*[!0-9]*) count=0 ;;
+	esac
+	if [ "$count" -ge "$REBOOT_MAX_IN_WINDOW" ]; then
+		log "CRITICAL: ${count} reboots in the last $((REBOOT_WINDOW / 3600))h, not rebooting again - this needs investigating"
+		return 1
+	fi
+	return 0
+}
+
+reboot_cpe() {
+	reboot_allowed || return 1
+
+	log "soft resets did not recover the link, rebooting the CPE"
+	printf '%s %s soft-reset-failed\n' "$(date +%s)" \
+		"$(date '+%Y-%m-%dT%H:%M:%S')" >> "$REBOOT_HISTORY"
+	if tail -n 50 "$REBOOT_HISTORY" > "${REBOOT_HISTORY}.tmp" 2>/dev/null; then
+		mv "${REBOOT_HISTORY}.tmp" "$REBOOT_HISTORY"
+	fi
+
+	run_timeout "$ADB_TIMEOUT" adb -s "$ADB_SERIAL" reboot
+	return 0
+}
+
+main() {
+	local attempt=0
+
+	resolve_target || return 1
+
+	if in_boot_grace; then
+		log "the CPE was rebooted moments ago, waiting for it to come back"
+		return 0
+	fi
+	if mwan3_busy; then
+		log "mwan3-check is mid-run, skipping this round"
+		return 0
+	fi
+	if ! iface_is_up; then
+		log "netifd reports ${IFACE} down, deferring"
+		return 0
+	fi
+	router_side_ok || return 0
+
+	if probe "$PROBE_ROUNDS" "$PROBE_GAP"; then
+		date '+%s %Y-%m-%dT%H:%M:%S' > "$HEARTBEAT"
+		return 0
+	fi
+
+	log "${CPE_ADDR} unreachable via ${DEVICE} after ${PROBE_ROUNDS} probe round(s)"
+
+	if [ "$CHECK_ONLY" = 1 ]; then
+		log "--check given, stopping before any repair"
+		return 1
+	fi
+
+	if ! adb_online; then
+		log "CRITICAL: adb is unreachable too, nothing can be repaired from here"
+		return 1
+	fi
+
+	take_repair_lock
+	while [ "$attempt" -lt "$SOFT_RESET_ATTEMPTS" ]; do
+		if [ "$(budget_left)" -lt "$REMEDY_COST" ]; then
+			log "runtime budget nearly spent, going to the reboot decision"
+			break
+		fi
+		attempt=$((attempt + 1))
+		log "soft reset attempt ${attempt}/${SOFT_RESET_ATTEMPTS}"
+		soft_reset
+		sleep "$SOFT_RESET_SETTLE"
+		if probe "$VERIFY_ROUNDS" "$VERIFY_GAP"; then
+			log "link recovered after soft reset attempt ${attempt}"
+			date '+%s %Y-%m-%dT%H:%M:%S' > "$HEARTBEAT"
+			drop_repair_lock
+			return 0
+		fi
+	done
+	drop_repair_lock
+
+	reboot_cpe
+}
+
+take_lock || {
+	log "another run is in progress, skipping"
+	exit 0
+}
+trap 'drop_repair_lock; rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
+main

@@ -6,7 +6,7 @@
 
 ## 1. 拓扑与目标
 
-两条上行链路，主线断了自动切备线，恢复后自动切回，并发邮件告警。
+两条上行链路，主线断了自动切备线，恢复后自动切回；两个用户态看门狗（第 5、6 节）分别兜底 mwan3 自身与 CPE 侧的已知异常状态。邮件告警（第 7 节）曾用于故障通知，目前已从路由器上移除。
 
 | mwan3 接口 | 载体 | 地址方式 | member metric |
 |---|---|---|---|
@@ -14,6 +14,8 @@
 | `cpe5g` | USB 4G/5G CPE（设备 `usb0`） | 静态 `192.168.66.10/24`，网关 `192.168.66.1` | 2（备） |
 
 有线 WAN 口（`eth1`）未参与，LAN 为 `br-lan`（`192.168.64.1/24`）。
+
+`cpe5g` 的载体不止一层：路由器通过 USB 挂载 CPE 设备，二者以 USB 网络 gadget（`usb0`，CDC 类接口）组网——路由器侧 `usb0` 即 `192.168.66.10/24`，CPE 侧 `usb0` 为网关 `192.168.66.1/24`。CPE 同一根 USB 线上还复合了 `adb` function，与网络 function 相互独立、互不影响，第 6 节的看门狗正是靠这条通路在网络假死时远程修复 CPE。`adb` 命令行工具已随 defconfig 编译进固件（详见 [rax3000m-optimizations.md 2.1 节](rax3000m-optimizations.md#21-adb-支持)），无需额外安装。
 
 ## 2. 无线中继的两个坑
 
@@ -64,7 +66,7 @@ opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn ip-full msmtp
 **mwan3 配置**：见 [docs/mwan3/config-mwan3](mwan3/config-mwan3)，可直接覆盖 `/etc/config/mwan3`。要点：
 
 - 两个 member 的 metric 为 1（`wifi5g`）/ 2（`cpe5g`），policy `wan_failover` 因此是主备而非负载均衡。
-- 探测目标 `119.29.29.29` / `223.5.5.5`，`interval=5`、`down=3`、`up=3`，即约 15 秒确认一次状态翻转——这层确认也顺带过滤掉了瞬时抖动，是第 6 节告警不必再做防抖的前提。
+- 探测目标 `119.29.29.29` / `223.5.5.5`，`interval=5`、`down=3`、`up=3`，即约 15 秒确认一次状态翻转——这层确认也顺带过滤掉了瞬时抖动，是第 7 节告警不必再做防抖的前提。
 - 只配了 IPv4 规则（`family ipv4`）。IPv6 在 policy 里显示 unreachable，属预期。
 
 **network 配置**要点：
@@ -116,9 +118,38 @@ uci set firewall.@zone[1].network='cpe5g wifi5g'
 */5 * * * * /usr/bin/mwan3-check >/dev/null 2>&1
 ```
 
-`--boot` 模式先等所有 member 起来（最多 180 秒）再检查。运行期间持有 `/tmp/mwan3-check.lock`（防止两次运行互相 bounce），修复动作期间额外持有 `/tmp/mwan3-check.repairing`，供第 6 节的告警脚本区分"看门狗正在修"和"链路真的变了"。
+`--boot` 模式先等所有 member 起来（最多 180 秒）再检查。运行期间持有 `/tmp/mwan3-check.lock`（防止两次运行互相 bounce），修复动作期间额外持有 `/tmp/mwan3-check.repairing`，供第 7 节的告警脚本区分"看门狗正在修"和"链路真的变了"；第 6 节的 `cpe-usb-watchdog` 也会读这两把锁来避让。
 
-## 6. 邮件告警
+## 6. 看门狗：cpe-usb-watchdog
+
+脚本：[docs/mwan3/cpe-usb-watchdog](mwan3/cpe-usb-watchdog) → 装到 `/usr/bin/cpe-usb-watchdog`。
+
+修复第 1 节提到的 CPE 侧 USB 网络 gadget 假死：两端 `usb0` 都报 `UP,LOWER_UP`、CPE 自身蜂窝数据与本机正常，但路由器 ping/HTTP 到 CPE 网关地址（`192.168.66.1`）持续不通，`ip neigh` 长时间无应答后连 MAC 都会丢（`FAILED`）。这不是内核感知到的硬件掉线（无 USB 断开/复位日志），是 gadget 数据通路本身卡住，netifd 和 mwan3 都观察不到异常，只能端到端探测才能发现。
+
+`adb` 在整个假死期间不受影响，因为它是 CPE 这台 USB 复合设备上独立于网络 function 的另一条通道，这也是"修复必须发生在 CPE 上、探测和触发却能放在路由器上"的前提：两端地址都在路由器 UCI 里声明（`network.cpe5g.ipaddr` / `.gateway`），链路断的时候依然读得到，不存在"不知道探测谁"的问题；CPE 侧则相反——它自己的邻居表在链路断时会连对端 MAC 一起丢，且该固件的 busybox 没有 `ip neigh`/`arping`，无法反查，所以看门狗只能放在路由器一侧。
+
+判定与修复逻辑：
+
+1. **前置检查**：`network.cpe5g` 未被 netifd 判定 up、或路由器侧 `usb0` 没有 UP/没有预期地址，说明是路由器自己的问题，直接让位给 `mwan3-check`，不碰 CPE。
+2. **探测**：ICMP 和 `/api/health` 互为第二意见，任一成功即判健康；连续 3 轮（间隔 8 秒）都失败才判定异常，避免瞬时抖动触发修复。
+3. **修复升级**：`adb shell` 里重置 connman 的 gadget tethering 会话并重新下发 `usb0` 地址（`connmanctl tether gadget off/disable/enable/tether gadget on` + `ifconfig`/`ip link set up`），复测；不行再来一轮；两轮仍不通就 `adb reboot` 重启 CPE。全程不碰 USB gadget 本身或 UDC，因为那会连 adb 一起重新枚举掉，等于自断退路。
+4. **重启限速**：最短间隔 1800 秒，6 小时窗口内最多 3 次，超过只记 `CRITICAL` 日志不再重启，交给人工介入，避免重启循环。
+5. **adb 也不通**：只记 `CRITICAL` 日志退出——多半是物理层问题，此时没有任何带外通道可用，看门狗无能为力。
+
+触发方式：
+
+```sh
+# crontab -e，与 mwan3-check 错开 2 分钟，避免同时抢 adb/USB
+2-59/5 * * * * /usr/bin/cpe-usb-watchdog >/dev/null 2>&1
+```
+
+**与 mwan3-check 的协调**：`cpe-usb-watchdog` 启动时检查 `mwan3-check.lock` 与 `.repairing`，只要 mwan3-check 在跑（不论是否在修复）就整轮跳过，因为 mwan3-check 的 `ifdown`/`ifup` 会让 CPE 短暂合理地不可达。这个避让只在入口检查一次，长达数分钟的修复过程中不会复查，是单向而非互斥锁——但两者故障域基本不重叠：`cpe-usb-watchdog` 只有路由器侧接口/地址都正常时才会继续（否则让位给 mwan3-check），而 mwan3-check 完全基于 netifd/`ip rule`/`ip route` 判断，不做端到端探测，CPE 网关假死但路由器侧一切正常时它根本不认为 `cpe5g` 有问题；`cpe-usb-watchdog` 的修复动作也只通过 adb 操作 CPE 内部，不触碰路由器侧 `cpe5g` 接口本身，不会产生 netifd 事件。两者极少会同时对同一目标动手，即使撞上，最坏后果也只是多花一轮探测时间，不会互相破坏。
+
+健康时只更新心跳文件 `/tmp/cpe-usb-watchdog.last-ok`，不写 syslog，避免每 5 分钟一条日志噪音；异常与修复动作走 `logread -e cpe-usb-watchdog`。
+
+## 7. 邮件告警（已停用）
+
+路由器上已移除邮件告警相关脚本、`mwan3.user` hook 与 SMTP 配置，当前不再运行。以下记录的坑与脚本文件保留，供以后需要时参考。
 
 三个文件配合：
 
@@ -137,13 +168,13 @@ echo 'you@example.com' > /etc/mwan3-notify/mail_to
 
 两个文件缺一时脚本静默跳过，所以可以先部署脚本、后配凭据。
 
-### 6.1 入口脚本必须立刻返回
+### 7.1 入口脚本必须立刻返回
 
 `mwan3.user` 是在 netifd/mwan3track 的 hotplug 链里**同步**调用的，而 `/etc/hotplug.d/iface/16-mwan3-user` 在调用前持有 `procd_lock`。在这里直接发邮件会把锁按住几十秒，阻塞后续接口事件。
 
 所以入口脚本只做参数检查，然后用 `start-stop-daemon -S -b -m` 把 worker 甩到后台，慢活（等锁、重试发信）全在 worker 里做。
 
-### 6.2 BusyBox start-stop-daemon 的 -x 要写解释器
+### 7.2 BusyBox start-stop-daemon 的 -x 要写解释器
 
 BusyBox 的 `start-stop-daemon -x` 匹配的是 `/proc/PID/cmdline` 里的 `argv[0]`。对 shell 脚本来说那是**解释器** `/bin/sh`，不是脚本路径。把脚本路径写成 `-x` 参数会匹配不到任何进程，去重静默失效，两个事件会各起一个 worker（实测确认）。正确写法：
 
@@ -151,7 +182,7 @@ BusyBox 的 `start-stop-daemon -x` 匹配的是 `/proc/PID/cmdline` 里的 `argv
 start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- "$WORKER" "$ACTION" "$INTERFACE" "$DEVICE"
 ```
 
-### 6.3 cryptodev 硬件加速导致 SMTP 发信失败
+### 7.3 cryptodev 硬件加速导致 SMTP 发信失败
 
 msmtp 走 gnutls，gnutls 会通过 `/dev/crypto`（cryptodev-linux）使用硬件加速。在本设备上这条路径与腾讯云 SES 的 SMTP（465，隐式 TLS）配合时会出错，发信直接失败；同样的凭据在别处正常，排查方向极易跑偏到证书、账号、端口上。
 
@@ -165,51 +196,57 @@ reboot
 
 `50-cryptodev` 的原始内容是 `cryptodev cryptodev_verbosity=-1`；本机备份留在 `/root/50-cryptodev.bak`。本设备无其它组件依赖 cryptodev 加速。
 
-### 6.4 worker 的两级等待
+### 7.4 worker 的两级等待
 
 1. **等修复锁**：看门狗自己重启 mwan3 或 bounce 接口，会让 mwan3track 对一条**从未真正断过**的链路重新播报 connected/disconnected。所以 worker 先等 `/tmp/mwan3-check.repairing` 消失（每 60 秒查一次，最多 2 次）。若一直没消失，说明看门狗 3 轮修复都没解决，此时发一封**"看门狗修复超时"**的告警，而不是把问题被去噪逻辑吞掉。
 2. **发信重试**：链路切换时网络本身就在抖，SMTP 发送很可能同时失败。失败后每 10 秒重试一次，最多 5 次。
 
 同一接口同时只允许一个 worker（pidfile 按接口区分）。第二个事件在前一个还在等锁/重试时会被**丢弃**而不是排队——mwan3 自己的 down=3/up=3（约 15 秒）已经过滤过抖动，能连续到达这里的重复事件没有保留价值。
 
-## 7. 从零部署清单
+## 8. 从零部署清单
 
 ```sh
 # 1. 换 ip
 opkg update && opkg install ip-full
 
-# 2. 装 mwan3 与发信工具
-opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn msmtp
+# 2. 装 mwan3
+opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn
 
 # 3. 配置两条上行（见第 4 节），确认 wifi5g、cpe5g 都能单独上网
 
 # 4. 覆盖 mwan3 配置
 scp docs/mwan3/config-mwan3 root@192.168.64.1:/etc/config/mwan3
 
-# 5. 部署脚本
-scp docs/mwan3/mwan3-check docs/mwan3/mwan3-notify.sh \
-    docs/mwan3/mwan3-notify-worker.sh root@192.168.64.1:/usr/bin/
-ssh root@192.168.64.1 'chmod +x /usr/bin/mwan3-check /usr/bin/mwan3-notify.sh /usr/bin/mwan3-notify-worker.sh'
+# 5. 部署看门狗脚本
+scp docs/mwan3/mwan3-check docs/mwan3/cpe-usb-watchdog root@192.168.64.1:/usr/bin/
+ssh root@192.168.64.1 'chmod +x /usr/bin/mwan3-check /usr/bin/cpe-usb-watchdog'
 
-# 6. 挂钩子：/etc/mwan3.user 末尾加 /usr/bin/mwan3-notify.sh
-#    /etc/rc.local 加 /usr/bin/mwan3-check --boot &
+# 6. 挂钩子：/etc/rc.local 加 /usr/bin/mwan3-check --boot &
 #    crontab 加 */5 * * * * /usr/bin/mwan3-check >/dev/null 2>&1
+#    crontab 加 2-59/5 * * * * /usr/bin/cpe-usb-watchdog >/dev/null 2>&1
 
-# 7. 配 SMTP（见第 6 节），并禁用 cryptodev（见 6.3）
-
-# 8. 重启验证
+# 7. 重启验证
 reboot
 ```
 
-## 8. 排查速查
+（可选）邮件告警目前未在本机启用，如需要按第 7 节额外部署 `msmtp`、通知脚本与 `mwan3.user` hook。
+
+## 9. 排查速查
 
 ```sh
 mwan3 status                       # 接口状态与当前策略
-mwan3-check                        # 手动跑一次看门狗，会打印判定结果
-logread -e mwan3-check             # 看门狗日志
-logread -e mwan3-notify            # 告警日志
+mwan3-check                        # 手动跑一次 mwan3 看门狗，会打印判定结果
+cpe-usb-watchdog --check           # 手动探测 CPE 链路，只报告不修复
+logread -e mwan3-check             # mwan3 看门狗日志
+logread -e cpe-usb-watchdog        # CPE 看门狗日志
 ip rule show                       # 策略规则是否存在（没有 = ip-full 没生效或 mwan3 没起来）
 ip route show table main           # 各接口默认路由
+```
+
+邮件告警已停用，以下两条仅在按第 7 节重新部署后才有意义：
+
+```sh
+logread -e mwan3-notify            # 告警日志
 msmtp -C /etc/mwan3-notify/msmtprc -a default --debug you@example.com < /dev/null   # 单独测发信
 ```
 
@@ -218,7 +255,9 @@ msmtp -C /etc/mwan3-notify/msmtprc -a default --debug you@example.com < /dev/nul
 | 现象 | 先查 |
 |---|---|
 | policy 恒为 unreachable | `/sbin/ip` 是否指向 `ip-full`（第 3 节） |
+| 路由器 `usb0` 状态正常但 ping/HTTP 不通 CPE，`adb` 仍可达 | CPE 端 USB gadget 假死，看门狗是否在跑（第 6 节） |
+| 连 `adb` 都连不上 CPE | 物理层/CPE 本身故障，看门狗无带外通道可用（第 6 节） |
 | 一直 "tracking is paused" 但链路正常 | 看门狗是否在跑（第 5 节） |
 | 中继连不上、握手即断 | 上游信道是否与本机 5G 一致（2.2 节） |
 | 状态乱跳、切换后流量没换路 | 两条链路是否来自同一台上游（2.1 节） |
-| 告警邮件发不出 | cryptodev 是否已禁用（6.3 节）、`msmtprc` 权限是否 600 |
+| （重新部署邮件告警后）发不出 | cryptodev 是否已禁用（7.3 节）、`msmtprc` 权限是否 600 |
