@@ -36,9 +36,35 @@ config member 'member_cpe5g'
 	option weight '1'
 	option interface 'cpe5g'
 
+config member 'member_wifi5g_backup'
+	option metric '2'
+	option weight '1'
+	option interface 'wifi5g'
+
+config member 'member_cpe5g_primary'
+	option metric '1'
+	option weight '1'
+	option interface 'cpe5g'
+
 config policy 'wan_failover'
 	list use_member 'member_cpe5g'
 	list use_member 'member_wifi5g'
+
+config policy 'prefer_cpe5g'
+	list use_member 'member_cpe5g_primary'
+	list use_member 'member_wifi5g_backup'
+
+# 以下 dest_ip 为示例占位（RFC 5737 文档保留地址段），实际生产环境的目标 IP
+# 不入库，按第 4 节说明在路由器本地配置。
+config rule 'cpe_example1'
+	option dest_ip '192.0.2.1/32'
+	option family 'ipv4'
+	option use_policy 'prefer_cpe5g'
+
+config rule 'cpe_example2'
+	option dest_ip '198.51.100.1/32'
+	option family 'ipv4'
+	option use_policy 'prefer_cpe5g'
 
 config rule 'default_rule_v4'
 	option dest_ip '0.0.0.0/0'

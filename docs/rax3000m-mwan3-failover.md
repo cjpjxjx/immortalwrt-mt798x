@@ -65,7 +65,8 @@ opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn ip-full msmtp
 
 **mwan3 配置**：见 [docs/mwan3/config-mwan3](mwan3/config-mwan3)，可直接覆盖 `/etc/config/mwan3`。要点：
 
-- 两个 member 的 metric 为 1（`wifi5g`）/ 2（`cpe5g`），policy `wan_failover` 因此是主备而非负载均衡。
+- 两个 member 的 metric 为 1（`wifi5g`）/ 2（`cpe5g`），policy `wan_failover` 因此是主备而非负载均衡，作为 `default_rule_v4` 的兜底策略覆盖所有目的 IP。
+- 另有 policy `prefer_cpe5g`：`member_cpe5g_primary`/`member_wifi5g_backup` 把主备关系反过来，只对少数几个特定目的 IP 生效（`dest_ip` 规则，归档文件里用 RFC 5737 文档保留地址占位，实际生产 IP 不入库，按需在路由器本地追加同结构的 `config rule`）。用于让个别对出口 IP 敏感的服务固定走 cpe5g，其余流量不受影响。
 - 探测目标 `119.29.29.29` / `223.5.5.5`，`interval=5`、`down=3`、`up=3`，即约 15 秒确认一次状态翻转——这层确认也顺带过滤掉了瞬时抖动，是第 7 节告警不必再做防抖的前提。
 - 只配了 IPv4 规则（`family ipv4`）。IPv6 在 policy 里显示 unreachable，属预期。
 
