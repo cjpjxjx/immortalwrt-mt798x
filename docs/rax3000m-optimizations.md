@@ -55,7 +55,7 @@
 2. **ApCli 中继模式**：扫描 AP 时用有线或非扫描频段连接管理界面；不用中继时将 ApClient 设为"禁用"，WAN 自动切回 `eth1`。
 3. **老旧 2.4G 设备连接异常**：可尝试 WPA-PSK+AES/WPA2-PSK+AES、切 N 模式、关 MU-MIMO、锁 20MHz、关强制 40MHz。
 4. **IGMP Snooping**：多播/视频卡顿可在无线设置中关闭。
-5. **双 WAN 故障转移**：mwan3 及其依赖（`ip-full`、`msmtp` 等）不在固件内，需刷机后 opkg 安装并部署配套脚本，详见 [rax3000m-mwan3-failover.md](rax3000m-mwan3-failover.md)。
+5. **双 WAN 故障转移**：mwan3 及其依赖（`ip-full`、`curl`、`openssl-util` 等）不在固件内，需刷机后 opkg 安装并部署配套脚本，详见 [rax3000m-mwan3-failover.md](rax3000m-mwan3-failover.md)。
 
 ## 7. 涉及的源码改动
 

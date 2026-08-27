@@ -36,6 +36,31 @@ NAME="cpe-usb-watchdog"
 CHECK_ONLY=0
 [ "$1" = "--check" ] && CHECK_ONLY=1
 
+# DingTalk push (see dingtalk-notify.sh for the signing/retry logic). Kept
+# optional: a missing lib only disables notifications, the watchdog itself
+# must keep repairing regardless.
+DINGTALK_LIB="/usr/bin/dingtalk-notify.sh"
+if [ -r "$DINGTALK_LIB" ]; then
+	# shellcheck disable=SC1090
+	. "$DINGTALK_LIB"
+else
+	dingtalk_push() { return 1; }
+fi
+DINGTALK_LOG_TAG="$NAME"
+
+# Cron runs this every 5 minutes; a fault that stays unresolved for hours
+# would otherwise mean a push every single run. These two files turn that
+# into "one push when a fault starts, one when it clears, one for each new
+# kind of escalation" instead:
+#   FAULT_MARKER     - a fault episode is open (created on first detection,
+#                       removed once a probe confirms recovery).
+#   ESCALATED_MARKER - a "needs a human" alert has already been sent for
+#                       this episode (adb unreachable, or the reboot cap
+#                       hit), so later rounds don't repeat it every 5
+#                       minutes. Cleared together with FAULT_MARKER.
+FAULT_MARKER="/tmp/${NAME}.faulted"
+ESCALATED_MARKER="/tmp/${NAME}.escalated"
+
 # uci interface holding the CPE link. Both endpoint addresses come from it.
 IFACE="cpe5g"
 # CPE-side gadget interface. Fixed by the CPE firmware's gadget config, not
@@ -302,6 +327,8 @@ reboot_allowed() {
 	esac
 	if [ "$count" -ge "$REBOOT_MAX_IN_WINDOW" ]; then
 		log "CRITICAL: ${count} reboots in the last $((REBOOT_WINDOW / 3600))h, not rebooting again - this needs investigating"
+		notify_escalation "CPE 重启超限" \
+			"过去 $((REBOOT_WINDOW / 3600)) 小时内已重启 ${count} 次，不再自动重启，需要人工介入。"
 		return 1
 	fi
 	return 0
@@ -317,8 +344,40 @@ reboot_cpe() {
 		mv "${REBOOT_HISTORY}.tmp" "$REBOOT_HISTORY"
 	fi
 
+	notify_result "CPE 已重启" "两轮软重置未能恢复，已通过 adb 重启 CPE，等待其恢复。"
 	run_timeout "$ADB_TIMEOUT" adb -s "$ADB_SERIAL" reboot
 	return 0
+}
+
+notify_detected() {
+	dingtalk_notify "CPE 假死" "$NAME" "$IFACE" "CPE 假死，正在尝试自动修复。"
+}
+
+# Only fires once per fault episode (gated by ESCALATED_MARKER) - covers the
+# two "nothing more this script can do automatically" cases: adb also
+# unreachable, and the reboot cap hit. Repeating either every 5 minutes
+# would just be noise once a human is already needed.
+notify_escalation() {
+	local event="$1" message="$2"
+
+	[ -e "$ESCALATED_MARKER" ] && return 0
+	: > "$ESCALATED_MARKER"
+	dingtalk_notify "$event" "$NAME" "$IFACE" "$message"
+}
+
+# Not gated: an actual reboot is new information each time it happens, and
+# is already rate-limited by reboot_allowed() (REBOOT_MIN_INTERVAL /
+# REBOOT_MAX_IN_WINDOW), so it can't itself turn into 5-minute spam.
+notify_result() {
+	local event="$1" message="$2"
+
+	dingtalk_notify "$event" "$NAME" "$IFACE" "$message"
+}
+
+notify_recovered() {
+	[ -e "$FAULT_MARKER" ] || return 0
+	dingtalk_notify "CPE 已恢复" "$NAME" "$IFACE" "CPE 探测恢复正常。"
+	rm -f "$FAULT_MARKER" "$ESCALATED_MARKER"
 }
 
 main() {
@@ -342,6 +401,7 @@ main() {
 
 	if probe "$PROBE_ROUNDS" "$PROBE_GAP"; then
 		date '+%s %Y-%m-%dT%H:%M:%S' > "$HEARTBEAT"
+		notify_recovered
 		return 0
 	fi
 
@@ -352,8 +412,14 @@ main() {
 		return 1
 	fi
 
+	if [ ! -e "$FAULT_MARKER" ]; then
+		: > "$FAULT_MARKER"
+		notify_detected
+	fi
+
 	if ! adb_online; then
 		log "CRITICAL: adb is unreachable too, nothing can be repaired from here"
+		notify_escalation "CPE 无法自动修复" "adb 也无法连接，没有可用的自动修复手段，需要人工检查。"
 		return 1
 	fi
 
@@ -371,6 +437,7 @@ main() {
 			log "link recovered after soft reset attempt ${attempt}"
 			date '+%s %Y-%m-%dT%H:%M:%S' > "$HEARTBEAT"
 			drop_repair_lock
+			notify_recovered
 			return 0
 		fi
 	done

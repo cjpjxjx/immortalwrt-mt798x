@@ -6,7 +6,7 @@
 
 ## 1. 拓扑与目标
 
-两条上行链路，主线断了自动切备线，恢复后自动切回；两个用户态看门狗（第 5、6 节）分别兜底 mwan3 自身与 CPE 侧的已知异常状态。邮件告警（第 7 节）曾用于故障通知，目前已从路由器上移除。
+两条上行链路，主线断了自动切备线，恢复后自动切回；两个用户态看门狗（第 5、6 节）分别兜底 mwan3 自身与 CPE 侧的已知异常状态。链路 up/down 由第 7 节的钉钉机器人 webhook 推送通知。
 
 | mwan3 接口 | 载体 | 地址方式 | member metric |
 |---|---|---|---|
@@ -58,10 +58,10 @@ ls -l /sbin/ip    # 应指向 /usr/libexec/ip-full
 
 ```sh
 opkg update
-opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn ip-full msmtp
+opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn ip-full curl openssl-util
 ```
 
-依赖会一并带入 `libbpf0`、`libelf1`、`libgnutls`、`libuci-lua`。
+依赖会一并带入 `libbpf0`、`libelf1`、`libuci-lua`。
 
 **mwan3 配置**：见 [docs/mwan3/config-mwan3](mwan3/config-mwan3)，可直接覆盖 `/etc/config/mwan3`。要点：
 
@@ -137,6 +137,12 @@ uci set firewall.@zone[1].network='cpe5g wifi5g'
 4. **重启限速**：最短间隔 1800 秒，6 小时窗口内最多 3 次，超过只记 `CRITICAL` 日志不再重启，交给人工介入，避免重启循环。
 5. **adb 也不通**：只记 `CRITICAL` 日志退出——多半是物理层问题，此时没有任何带外通道可用，看门狗无能为力。
 
+**钉钉推送**：复用第 7 节的 [docs/mwan3/dingtalk-notify.sh](mwan3/dingtalk-notify.sh) 共享推送函数（同一份 `dingtalk.conf`）。cron 每 5 分钟跑一次，若直接照搬"每次判定异常就推"会在长时间故障时刷屏，所以用两个跨轮次的标记文件控制只在状态**变化**时推送：
+
+- `/tmp/cpe-usb-watchdog.faulted` —— 一次故障期间存在。首次判定假死（非 `--check`）时创建并推"CPE 假死，开始处理"；探测恢复健康时删除并推"CPE 已恢复"（无论恢复发生在本轮软重置之后，还是重启 CPE 后的某一轮被动探测确认，都会补这条确认）。
+- `/tmp/cpe-usb-watchdog.escalated` —— 本次故障期间是否已经发过"需要人工介入"的提醒。adb 也联系不上、或重启次数触顶这两种"脚本自己已经无能为力"的情况各自只推一次，不会每 5 分钟重复；与 `.faulted` 一起在恢复时清除。
+- 真正触发 `adb reboot` 这一步不受上面两个标记限制，每次实际重启都会推一条——重启本身已经被限速（最短间隔 1800 秒、6 小时最多 3 次），不会变成刷屏源。
+
 触发方式：
 
 ```sh
@@ -148,32 +154,34 @@ uci set firewall.@zone[1].network='cpe5g wifi5g'
 
 健康时只更新心跳文件 `/tmp/cpe-usb-watchdog.last-ok`，不写 syslog，避免每 5 分钟一条日志噪音；异常与修复动作走 `logread -e cpe-usb-watchdog`。
 
-## 7. 邮件告警（已停用）
+## 7. 钉钉机器人告警
 
-路由器上已移除邮件告警相关脚本、`mwan3.user` hook 与 SMTP 配置，当前不再运行。以下记录的坑与脚本文件保留，供以后需要时参考。
+mwan3 链路 up/down 事件、以及第 6 节 `cpe-usb-watchdog` 的假死检测/处理结果，都通过钉钉自定义机器人 webhook 推送通知，安全设置用**加签**（[官方文档](https://open.dingtalk.com/document/robots/custom-robot-access)）。此前用过邮件（msmtp/SMTP）告警，已替换为本方案。
 
-三个文件配合：
+推送内容只保留结论性信息，不带 `mwan3 status` 的完整状态表——需要排查再手动登录看，告警本身只回答"发生了什么、结果如何"。格式由 `dingtalk-notify.sh` 的 `dingtalk_notify` 统一生成，`mwan3-notify` 和 `cpe-usb-watchdog` 两个推送源用的是同一套模板：标题固定为"`RAX3000M - <事件>`"（`RAX3000M` 是本仓库唯一面向的设备型号，写死在库里，不依赖可能没改过的 `system.hostname`）。钉钉 markdown 消息的 `title` 字段只用于会话列表/通知栏预览，消息气泡本身只渲染 `text`，所以同一个标题会在正文开头以 `####` 标题重复一次，接着是固定的来源/接口/时间/详情四行，详情只写一句话——发生了什么、处理方式或结果，不加括号解释。
+
+四个文件配合：
 
 - `/etc/mwan3.user` —— 末尾追加一行 `/usr/bin/mwan3-notify.sh`
+- [docs/mwan3/dingtalk-notify.sh](mwan3/dingtalk-notify.sh) → `/usr/bin/dingtalk-notify.sh`，加签、JSON 转义、推送重试的公共逻辑，被 `mwan3-notify-worker.sh` 和第 6 节的 `cpe-usb-watchdog` 一起 `.` source，只写一份
 - [docs/mwan3/mwan3-notify.sh](mwan3/mwan3-notify.sh) → `/usr/bin/mwan3-notify.sh`
 - [docs/mwan3/mwan3-notify-worker.sh](mwan3/mwan3-notify-worker.sh) → `/usr/bin/mwan3-notify-worker.sh`
 
-配置（路由器本地，不入库）：
+配置（路由器本地，不入库，`mwan3-notify` 和 `cpe-usb-watchdog` 共用同一份）：
 
 ```sh
 mkdir -p /etc/mwan3-notify
-# 按 docs/mwan3/msmtprc.example 填好真实凭据
-vi /etc/mwan3-notify/msmtprc && chmod 600 /etc/mwan3-notify/msmtprc
-echo 'you@example.com' > /etc/mwan3-notify/mail_to
+# 按 docs/mwan3/dingtalk-notify.conf.example 填好真实的 access_token、加签 secret
+vi /etc/mwan3-notify/dingtalk.conf && chmod 600 /etc/mwan3-notify/dingtalk.conf
 ```
 
-两个文件缺一时脚本静默跳过，所以可以先部署脚本、后配凭据。
+`dingtalk.conf` 缺失或缺 `ACCESS_TOKEN`/`SECRET` 时，`dingtalk_push` 静默跳过并返回非 0；`cpe-usb-watchdog` 在 `dingtalk-notify.sh` 缺失时也会定义一个空的 `dingtalk_push` 存根，不影响看门狗本身的探测/修复逻辑，只是不推送。所以可以先部署脚本、后配凭据。
 
 ### 7.1 入口脚本必须立刻返回
 
-`mwan3.user` 是在 netifd/mwan3track 的 hotplug 链里**同步**调用的，而 `/etc/hotplug.d/iface/16-mwan3-user` 在调用前持有 `procd_lock`。在这里直接发邮件会把锁按住几十秒，阻塞后续接口事件。
+`mwan3.user` 是在 netifd/mwan3track 的 hotplug 链里**同步**调用的，而 `/etc/hotplug.d/iface/16-mwan3-user` 在调用前持有 `procd_lock`。在这里直接发 HTTP 请求会把锁按住几十秒（尤其是重试期间），阻塞后续接口事件。
 
-所以入口脚本只做参数检查，然后用 `start-stop-daemon -S -b -m` 把 worker 甩到后台，慢活（等锁、重试发信）全在 worker 里做。
+所以入口脚本只做参数检查，然后用 `start-stop-daemon -S -b -m` 把 worker 甩到后台，慢活（等锁、重试推送）全在 worker 里做。
 
 ### 7.2 BusyBox start-stop-daemon 的 -x 要写解释器
 
@@ -183,11 +191,9 @@ BusyBox 的 `start-stop-daemon -x` 匹配的是 `/proc/PID/cmdline` 里的 `argv
 start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- "$WORKER" "$ACTION" "$INTERFACE" "$DEVICE"
 ```
 
-### 7.3 cryptodev 硬件加速导致 SMTP 发信失败
+### 7.3 cryptodev 硬件加速不影响 curl
 
-msmtp 走 gnutls，gnutls 会通过 `/dev/crypto`（cryptodev-linux）使用硬件加速。在本设备上这条路径与腾讯云 SES 的 SMTP（465，隐式 TLS）配合时会出错，发信直接失败；同样的凭据在别处正常，排查方向极易跑偏到证书、账号、端口上。
-
-禁用 cryptodev 后 gnutls 回落到软件实现，发信恢复正常：
+此前用 msmtp/gnutls 走 SMTP（465，隐式 TLS）时，本机的 cryptodev 硬件加速（`/dev/crypto`）会导致 gnutls 发信失败，需禁用后才能回落到软件实现：
 
 ```sh
 cp /etc/modules.d/50-cryptodev /root/50-cryptodev.bak
@@ -195,12 +201,14 @@ rm /etc/modules.d/50-cryptodev
 reboot
 ```
 
-`50-cryptodev` 的原始内容是 `cryptodev cryptodev_verbosity=-1`；本机备份留在 `/root/50-cryptodev.bak`。本设备无其它组件依赖 cryptodev 加速。
+`50-cryptodev` 的原始内容是 `cryptodev cryptodev_verbosity=-1`；本机备份留在 `/root/50-cryptodev.bak`（当时为 msmtp 停用的，现无需再管）。
+
+钉钉 webhook 走 `curl` + HTTPS，已在本机 `cryptodev` 模块正常加载（`lsmod` 可见）的情况下实测推送成功，不受此坑影响，无需禁用 cryptodev。curl 走的 TLS 后端与依赖链和 msmtp 的 gnutls 路径不同，是这条坑不复现的原因。
 
 ### 7.4 worker 的两级等待
 
 1. **等修复锁**：看门狗自己重启 mwan3 或 bounce 接口，会让 mwan3track 对一条**从未真正断过**的链路重新播报 connected/disconnected。所以 worker 先等 `/tmp/mwan3-check.repairing` 消失（每 60 秒查一次，最多 2 次）。若一直没消失，说明看门狗 3 轮修复都没解决，此时发一封**"看门狗修复超时"**的告警，而不是把问题被去噪逻辑吞掉。
-2. **发信重试**：链路切换时网络本身就在抖，SMTP 发送很可能同时失败。失败后每 10 秒重试一次，最多 5 次。
+2. **推送重试**：链路切换时网络本身就在抖，webhook 请求很可能同时失败。失败后每 10 秒重试一次，最多 5 次。
 
 同一接口同时只允许一个 worker（pidfile 按接口区分）。第二个事件在前一个还在等锁/重试时会被**丢弃**而不是排队——mwan3 自己的 down=3/up=3（约 15 秒）已经过滤过抖动，能连续到达这里的重复事件没有保留价值。
 
@@ -230,7 +238,7 @@ ssh root@192.168.64.1 'chmod +x /usr/bin/mwan3-check /usr/bin/cpe-usb-watchdog'
 reboot
 ```
 
-（可选）邮件告警目前未在本机启用，如需要按第 7 节额外部署 `msmtp`、通知脚本与 `mwan3.user` hook。
+（可选）钉钉机器人告警按第 7 节部署：`opkg install curl openssl-util`、拷贝 `dingtalk-notify.sh`/`mwan3-notify.sh`/`mwan3-notify-worker.sh`、配置 `dingtalk.conf`、`/etc/mwan3.user` 追加 hook；`cpe-usb-watchdog` 已经在第 5 步部署过，只要 `dingtalk-notify.sh` 和 `dingtalk.conf` 就位就会自动一起推送，不用额外步骤。
 
 ## 9. 排查速查
 
@@ -244,11 +252,13 @@ ip rule show                       # 策略规则是否存在（没有 = ip-full
 ip route show table main           # 各接口默认路由
 ```
 
-邮件告警已停用，以下两条仅在按第 7 节重新部署后才有意义：
+以下两条仅在按第 7 节部署了钉钉告警后才有意义：
 
 ```sh
 logread -e mwan3-notify            # 告警日志
-msmtp -C /etc/mwan3-notify/msmtprc -a default --debug you@example.com < /dev/null   # 单独测发信
+curl -sS -m 10 -H 'Content-Type: application/json' \
+  -d '{"msgtype":"text","text":{"content":"mwan3-notify 手动测试"}}' \
+  "https://oapi.dingtalk.com/robot/send?access_token=<access_token>&timestamp=<ms>&sign=<urlencoded_sign>"   # 单独测推送，timestamp/sign 需现算
 ```
 
 对照表：
@@ -261,4 +271,4 @@ msmtp -C /etc/mwan3-notify/msmtprc -a default --debug you@example.com < /dev/nul
 | 一直 "tracking is paused" 但链路正常 | 看门狗是否在跑（第 5 节） |
 | 中继连不上、握手即断 | 上游信道是否与本机 5G 一致（2.2 节） |
 | 状态乱跳、切换后流量没换路 | 两条链路是否来自同一台上游（2.1 节） |
-| （重新部署邮件告警后）发不出 | cryptodev 是否已禁用（7.3 节）、`msmtprc` 权限是否 600 |
+| （部署钉钉告警后）推送发不出 | `curl`/`openssl-util` 是否已装、`dingtalk.conf` 权限是否 600、`sign` 是否算错（7.3、7 节） |

@@ -1,0 +1,15 @@
+# DingTalk custom robot webhook config for mwan3-notify-worker.sh - fill in
+# real values and copy to /etc/mwan3-notify/dingtalk.conf ON THE ROUTER ONLY.
+# Do not commit a filled-in copy of this file anywhere in the repo.
+#
+# chmod 600 /etc/mwan3-notify/dingtalk.conf after copying: it holds a
+# webhook secret.
+#
+# In the DingTalk group: group settings -> robots -> add a custom robot,
+# security setting "加签"（签名校验）. ACCESS_TOKEN is the access_token query
+# parameter of the webhook URL DingTalk shows you; SECRET is the separate
+# "SEC..." string shown for the 加签 setting. See
+# https://open.dingtalk.com/document/robots/custom-robot-access
+
+ACCESS_TOKEN=<access_token>
+SECRET=<secret>
