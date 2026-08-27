@@ -143,7 +143,7 @@ uci set firewall.@zone[1].network='cpe5g wifi5g'
 - `/tmp/cpe-usb-watchdog.escalated` —— 本次故障期间是否已经发过"需要人工介入"的提醒。adb 也联系不上、或重启次数触顶这两种"脚本自己已经无能为力"的情况各自只推一次，不会每 5 分钟重复；与 `.faulted` 一起在恢复时清除。
 - 真正触发 `adb reboot` 这一步不受上面两个标记限制，每次实际重启都会推一条——重启本身已经被限速（最短间隔 1800 秒、6 小时最多 3 次），不会变成刷屏源。
 
-触发方式：
+触发方式：cron 定时 + mwan3 掉线事件（见 6.1）两条入口。
 
 ```sh
 # crontab -e，与 mwan3-check 错开 2 分钟，避免同时抢 adb/USB
@@ -153,6 +153,23 @@ uci set firewall.@zone[1].network='cpe5g wifi5g'
 **与 mwan3-check 的协调**：`cpe-usb-watchdog` 启动时检查 `mwan3-check.lock` 与 `.repairing`，只要 mwan3-check 在跑（不论是否在修复）就整轮跳过，因为 mwan3-check 的 `ifdown`/`ifup` 会让 CPE 短暂合理地不可达。这个避让只在入口检查一次，长达数分钟的修复过程中不会复查，是单向而非互斥锁——但两者故障域基本不重叠：`cpe-usb-watchdog` 只有路由器侧接口/地址都正常时才会继续（否则让位给 mwan3-check），而 mwan3-check 完全基于 netifd/`ip rule`/`ip route` 判断，不做端到端探测，CPE 网关假死但路由器侧一切正常时它根本不认为 `cpe5g` 有问题；`cpe-usb-watchdog` 的修复动作也只通过 adb 操作 CPE 内部，不触碰路由器侧 `cpe5g` 接口本身，不会产生 netifd 事件。两者极少会同时对同一目标动手，即使撞上，最坏后果也只是多花一轮探测时间，不会互相破坏。
 
 健康时只更新心跳文件 `/tmp/cpe-usb-watchdog.last-ok`，不写 syslog，避免每 5 分钟一条日志噪音；异常与修复动作走 `logread -e cpe-usb-watchdog`。
+
+### 6.1 事件触发：mwan3 判定 cpe5g 掉线时立即检查
+
+脚本：[docs/mwan3/mwan3-cpe-trigger.sh](mwan3/mwan3-cpe-trigger.sh) → 装到 `/usr/bin/mwan3-cpe-trigger.sh`，在 `/etc/mwan3.user` 里与 `mwan3-notify.sh` 并列追加一行。
+
+只靠 cron，一次假死最多要等 5 分钟才被发现。而 CPE 假死会让 mwan3 的 track 探测失败（mwan3track 与流量走哪条线无关，备线也一直在探），约 15 秒后就报 `cpe5g` `disconnected`——这个事件是现成的提示，收到就立刻跑一次看门狗，把发现延迟压到秒级。
+
+- 只对 `ACTION=disconnected` + `INTERFACE=cpe5g` 生效，其余事件直接退出。
+- 冷却 300 秒（与 cron 周期一致），时间戳记在 `/tmp/cpe-usb-watchdog.last-trigger`。链路抖动会连着丢来多个 `disconnected`，而软重置本身没有限速（只有 CPE 重启有），事件驱动不能把修复节奏抬得比定时更快。
+- 与 cron 撞车由看门狗自己的 `mkdir` 锁裁决（原子，谁先谁赢，输的整轮跳过），单轮 `MAX_RUNTIME=240` 秒小于 cron 的 300 秒间隔，正常不会重叠。
+- 判定"是不是真假死"完全交给看门狗原有的入口检查，触发器不做任何判断：netifd 层真掉线、路由器侧接口/地址异常、CPE 刚被重启还在启动中，这几种情况看门狗本来就会让位或等待。
+
+cron 那条不能撤，它承担事件路径覆盖不到的部分：mwan3 自己的 tracker 卡在 paused 时根本不会有事件；一次修复没成功（重启被限速、运行预算耗尽）后链路持续断着也不会再来新事件，重试靠 cron；`adb reboot` 之后的"CPE 已恢复"确认同样由后续某轮 cron 的被动探测补上。
+
+部署了第 7 节的钉钉告警时，一次假死会收到两条推送：`mwan3` 源的"cpe5g 掉线"和 `cpe-usb-watchdog` 源的"CPE 假死"，分别回答"线路断了"和"原因已定位、正在修"，属预期。
+
+入口脚本同样受 7.1、7.2 两条约束（procd_lock 下必须立刻返回、`start-stop-daemon -x` 要写解释器），且刻意不合并进 `mwan3-notify.sh`：后者在 `curl`/`openssl`/`dingtalk.conf` 任一缺失时会提前退出，合并会把修复触发一起静默掉。
 
 ## 7. 钉钉机器人告警
 
@@ -227,12 +244,13 @@ opkg install mwan3 luci-app-mwan3 luci-i18n-mwan3-zh-cn
 scp docs/mwan3/config-mwan3 root@192.168.64.1:/etc/config/mwan3
 
 # 5. 部署看门狗脚本
-scp docs/mwan3/mwan3-check docs/mwan3/cpe-usb-watchdog root@192.168.64.1:/usr/bin/
-ssh root@192.168.64.1 'chmod +x /usr/bin/mwan3-check /usr/bin/cpe-usb-watchdog'
+scp docs/mwan3/mwan3-check docs/mwan3/cpe-usb-watchdog docs/mwan3/mwan3-cpe-trigger.sh root@192.168.64.1:/usr/bin/
+ssh root@192.168.64.1 'chmod +x /usr/bin/mwan3-check /usr/bin/cpe-usb-watchdog /usr/bin/mwan3-cpe-trigger.sh'
 
 # 6. 挂钩子：/etc/rc.local 加 /usr/bin/mwan3-check --boot &
 #    crontab 加 */5 * * * * /usr/bin/mwan3-check >/dev/null 2>&1
 #    crontab 加 2-59/5 * * * * /usr/bin/cpe-usb-watchdog >/dev/null 2>&1
+#    /etc/mwan3.user 末尾加 /usr/bin/mwan3-cpe-trigger.sh（第 6.1 节，与钉钉告警无关，必装）
 
 # 7. 重启验证
 reboot
@@ -248,6 +266,7 @@ mwan3-check                        # 手动跑一次 mwan3 看门狗，会打印
 cpe-usb-watchdog --check           # 手动探测 CPE 链路，只报告不修复
 logread -e mwan3-check             # mwan3 看门狗日志
 logread -e cpe-usb-watchdog        # CPE 看门狗日志
+logread -e mwan3-cpe-trigger       # 事件触发入口日志（启动了、还是被冷却/去重挡掉）
 ip rule show                       # 策略规则是否存在（没有 = ip-full 没生效或 mwan3 没起来）
 ip route show table main           # 各接口默认路由
 ```
@@ -268,6 +287,7 @@ curl -sS -m 10 -H 'Content-Type: application/json' \
 | policy 恒为 unreachable | `/sbin/ip` 是否指向 `ip-full`（第 3 节） |
 | 路由器 `usb0` 状态正常但 ping/HTTP 不通 CPE，`adb` 仍可达 | CPE 端 USB gadget 假死，看门狗是否在跑（第 6 节） |
 | 连 `adb` 都连不上 CPE | 物理层/CPE 本身故障，看门狗无带外通道可用（第 6 节） |
+| CPE 假死后要等到下一个 cron 周期才处理 | `/etc/mwan3.user` 是否挂了 `mwan3-cpe-trigger.sh`，以及本轮是否落在 300 秒冷却内（6.1 节） |
 | 一直 "tracking is paused" 但链路正常 | 看门狗是否在跑（第 5 节） |
 | 中继连不上、握手即断 | 上游信道是否与本机 5G 一致（2.2 节） |
 | 状态乱跳、切换后流量没换路 | 两条链路是否来自同一台上游（2.1 节） |
