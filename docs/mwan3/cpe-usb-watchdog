@@ -198,7 +198,7 @@ iface_is_up() {
 # A router-side interface that is down, or has lost its own address, is netifd's
 # or mwan3-check's problem. Rebooting the CPE would not fix either.
 router_side_ok() {
-	ip link show dev "$DEVICE" 2>/dev/null | grep -q "state UP" || {
+	ip link show dev "$DEVICE" 2>/dev/null | grep -q "LOWER_UP" || {
 		log "${DEVICE} is not UP on this side, deferring"
 		return 1
 	}

@@ -129,6 +129,8 @@ uci set firewall.@zone[1].network='cpe5g wifi5g'
 
 `adb` 在整个假死期间不受影响，因为它是 CPE 这台 USB 复合设备上独立于网络 function 的另一条通道，这也是"修复必须发生在 CPE 上、探测和触发却能放在路由器上"的前提：两端地址都在路由器 UCI 里声明（`network.cpe5g.ipaddr` / `.gateway`），链路断的时候依然读得到，不存在"不知道探测谁"的问题；CPE 侧则相反——它自己的邻居表在链路断时会连对端 MAC 一起丢，且该固件的 busybox 没有 `ip neigh`/`arping`，无法反查，所以看门狗只能放在路由器一侧。
 
+CPE 的 USB 网络 function 曾用 CDC-ECM 模式，一天出现多次假死；切换到 RNDIS 模式后假死消失，但 RNDIS 驱动不会同步更新路由器侧 `usb0` 的 `netdev` operstate——`ip link show` 的 `state` 字段停留在 `UNKNOWN`，即使链路正常也不会变成 `UP`，`LOWER_UP` 标志位则不受影响、始终正确反映 carrier 状态。`router_side_ok()` 判断路由器侧接口是否正常因此按 `LOWER_UP` 标志位而非 `state` 字段取值，否则 RNDIS 模式下会一直误判为路由器侧异常并跳过探测/修复，2026-08-28~30 期间发生过。
+
 判定与修复逻辑：
 
 1. **前置检查**：`network.cpe5g` 未被 netifd 判定 up、或路由器侧 `usb0` 没有 UP/没有预期地址，说明是路由器自己的问题，直接让位给 `mwan3-check`，不碰 CPE。
